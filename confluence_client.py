@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import time
+from threading import Lock
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,20 @@ from dotenv import load_dotenv
 
 # Resolve .env relative to this file, not to the MCP client's working directory.
 load_dotenv(dotenv_path=Path(__file__).resolve().with_name('.env'))
+
+# Shared by all readers/tools in this process, including concurrent calls.
+_request_lock = Lock()
+_last_request_at: float | None = None
+
+
+def _wait_for_request(interval_ms: int) -> None:
+    global _last_request_at
+    with _request_lock:
+        if _last_request_at is not None:
+            remaining = interval_ms / 1000 - (time.monotonic() - _last_request_at)
+            if remaining > 0:
+                time.sleep(remaining)
+        _last_request_at = time.monotonic()
 
 
 class ConfluenceError(Exception):
@@ -29,6 +46,11 @@ class Settings:
     timeout_seconds: float = 30.0
     max_page_bytes: int = 5_000_000
     ca_bundle: str | None = None
+    request_interval_ms: int = 1000
+
+    def __post_init__(self) -> None:
+        if type(self.request_interval_ms) is not int or self.request_interval_ms < 0:
+            raise ConfluenceError('CONFLUENCE_REQUEST_INTERVAL_MS must be a non-negative integer.')
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -48,14 +70,15 @@ class Settings:
         try:
             timeout = float(os.getenv('CONFLUENCE_TIMEOUT_SECONDS', '30'))
             max_bytes = int(os.getenv('CONFLUENCE_MAX_PAGE_BYTES', '5000000'))
+            interval_ms = int(os.getenv('CONFLUENCE_REQUEST_INTERVAL_MS', '1000'))
         except ValueError as exc:
-            raise ConfluenceError('Invalid timeout or max page size in .env.') from exc
+            raise ConfluenceError('Invalid timeout, max page size or request interval in .env.') from exc
         if timeout <= 0 or max_bytes <= 0:
             raise ConfluenceError('Timeout and max page size must be positive.')
         ca_bundle = os.getenv('CONFLUENCE_CA_BUNDLE', '').strip() or None
         if ca_bundle and not Path(ca_bundle).is_file():
             raise ConfluenceError(f'CA certificate bundle does not exist: {ca_bundle}')
-        return cls(base_url, username, password, timeout, max_bytes, ca_bundle)
+        return cls(base_url, username, password, timeout, max_bytes, ca_bundle, interval_ms)
 
     def validate_url(self, url: str) -> str:
         """Allow only URLs under the configured Confluence context path and origin."""
@@ -168,6 +191,7 @@ class ConfluenceReader:
             ) as client:
                 current = url
                 for _ in range(6):
+                    _wait_for_request(self.settings.request_interval_ms)
                     with client.stream('GET', current, params=params, headers={'Accept': accept}) as response:
                         params = None  # Redirect Location contains the destination query.
                         if response.status_code in (301, 302, 303, 307, 308):
@@ -196,6 +220,79 @@ class ConfluenceReader:
                 raise ConfluenceError('Too many Confluence redirects.')
         except httpx.RequestError as exc:
             raise ConfluenceError(f'Cannot connect to Confluence ({type(exc).__name__}).') from exc
+
+    def search_pages(
+        self, query: str, search_in: str = 'all', limit: int = 5,
+        start: int = 0, snippet_chars: int = 500,
+    ) -> dict[str, Any]:
+        """Search one bounded CQL page; never fetch full page bodies or follow next links."""
+        if not isinstance(query, str) or not query.strip() or len(query) > 500:
+            raise ConfluenceError('query must contain 1–500 characters.')
+        if search_in not in ('title', 'content', 'all'):
+            raise ConfluenceError('search_in must be title, content or all.')
+        for name, value, low, high in (
+            ('limit', limit, 1, 20), ('start', start, 0, 1_000_000),
+            ('snippet_chars', snippet_chars, 50, 1000),
+        ):
+            if type(value) is not int or not low <= value <= high:
+                raise ConfluenceError(f'{name} must be an integer between {low} and {high}.')
+        # Escape both the CQL string and Lucene text-search metacharacters.
+        literal = re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r'\\\1', query.strip())
+        phrase = '"' + literal + '"'
+        value = '"' + phrase.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        clause = {'title': f'title ~ {value}', 'content': f'text ~ {value}',
+                  'all': f'(title ~ {value} OR text ~ {value})'}[search_in]
+        raw, charset = self._get(
+            f'{self.settings.base_url}/rest/api/search',
+            params={'cql': f'type = page AND {clause}', 'limit': str(limit),
+                    'start': str(start), 'excerpt': 'highlight'},
+            accept='application/json',
+        )
+        try:
+            data = json.loads(raw.decode(charset))
+        except (ValueError, UnicodeError, LookupError) as exc:
+            raise ConfluenceError('Confluence search did not return valid JSON.') from exc
+        if not isinstance(data, dict) or not isinstance(data.get('results'), list):
+            raise ConfluenceError('Unexpected Confluence search response.')
+        results = data['results']
+        output: dict[str, Any] = {'pages': [], 'has_more': False, 'next_start': None,
+                                  'truncated': False}
+        for item in results[:limit]:
+            if not isinstance(item, dict) or not isinstance(item.get('content'), dict):
+                raise ConfluenceError('Unexpected Confluence search result.')
+            content = item['content']
+            page_id = str(content.get('id', ''))
+            if not re.fullmatch(r'[1-9]\d*', page_id) or len(page_id) > 30:
+                raise ConfluenceError('Invalid page ID in Confluence search result.')
+            fallback = f'{self.settings.base_url}/pages/viewpage.action?pageId={page_id}'
+            webui = (content.get('_links') or {}).get('webui') or item.get('url')
+            url = urljoin(self.settings.base_url + '/', webui) if isinstance(webui, str) else fallback
+            self.settings.validate_url(url)
+            if len(json.dumps(url)) > 4000:
+                url = fallback
+            title = str(content.get('title') or item.get('title') or '')
+            excerpt = BeautifulSoup(str(item.get('excerpt') or ''), 'html.parser')
+            for tag in excerpt.find_all(['script', 'style', 'noscript', 'template']):
+                tag.decompose()
+            matches = ' '.join(excerpt.get_text(' ', strip=True).split())
+            matches = matches.replace('@@@hl@@@', '**').replace('@@@endhl@@@', '**')
+            entry = {'page_id': page_id, 'title': title[:300], 'url': url,
+                     'matches': matches[:snippet_chars],
+                     'truncated': len(title) > 300 or len(matches) > snippet_chars}
+            output['pages'].append(entry)
+            # Reserve room for pagination metadata. Includes JSON escaping overhead.
+            if len(json.dumps(output)) > 15_500:
+                output['pages'].pop()
+                if not output['pages']:
+                    raise ConfluenceError('Search result URL exceeds the response budget; check CONFLUENCE_BASE_URL.')
+                output['truncated'] = True
+                break
+        consumed = len(output['pages'])
+        links = data.get('_links') or {}
+        output['has_more'] = bool(consumed < len(results) or links.get('next') or len(results) >= limit)
+        output['next_start'] = start + consumed if output['has_more'] else None
+        output['truncated'] = output['truncated'] or any(p['truncated'] for p in output['pages'])
+        return output
 
     def by_id(self, page_id: str | int) -> dict[str, Any]:
         page_id = str(page_id)
@@ -266,3 +363,4 @@ class ConfluenceReader:
             **parse_content(str(content), url),
             'note': 'HTML and media references are returned, but JavaScript is not executed; interactive macros, diagrams and images may require a browser or separate authenticated retrieval.',
         }
+

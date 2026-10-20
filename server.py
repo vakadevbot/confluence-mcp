@@ -30,6 +30,28 @@ def _reader() -> ConfluenceReader:
 
 
 @mcp.tool()
+def search_pages(query: str, search_in: str = 'all', limit: int = 5,
+                 start: int = 0, snippet_chars: int = 500) -> dict[str, Any]:
+    """Search Confluence pages by title/content using a literal word or phrase.
+    search_in: title, content (Confluence text index), or all. Returns titles,
+    URLs and short matching excerpts; ** marks highlighted matches when supplied
+    by Confluence. No full page bodies. Defaults: 5 pages, 500 excerpt characters.
+    Hard limits: 20 pages, 1000 excerpt characters, 16000 serialized JSON characters.
+    Use next_start as start to explicitly request another page; no auto-pagination.
+    truncated indicates shortened fields or a response-size limit.
+    """
+    logger.info('search_pages started: search_in=%s, limit=%s, start=%s', search_in, limit, start)
+    try:
+        result = _reader().search_pages(query, search_in, limit, start, snippet_chars)
+    except Exception:
+        logger.exception('search_pages failed')
+        raise
+    logger.info('search_pages completed: pages=%d, has_more=%s',
+                len(result['pages']), result['has_more'])
+    return result
+
+
+@mcp.tool()
 def get_page_by_id(page_id: str) -> dict[str, Any]:
     """Read a Confluence page by numeric ID. Returns rendered HTML, text, links,
     image URLs, embedded media and macro metadata. Read-only: no page changes.
@@ -79,3 +101,4 @@ if __name__ == "__main__":
         raise
     finally:
         logger.info("MCP server stopped")
+
