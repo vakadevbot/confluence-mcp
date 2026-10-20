@@ -16,11 +16,13 @@ logger.info("Process starting: pid=%s, Python=%s", os.getpid(), sys.version.spli
 try:
     from mcp.server.fastmcp import FastMCP
     from confluence_client import ConfluenceReader, Settings
-except Exception:
-    logger.exception("Failed to import MCP server dependencies")
-    raise
 
-mcp = FastMCP("confluence-readonly")
+    # confluence_client loads .env; apply CONFLUENCE_LOG_LEVEL if set there.
+    configure_logging()
+    mcp = FastMCP("confluence-readonly")
+except Exception:
+    logger.exception("Failed to initialize MCP server")
+    raise
 
 
 def _reader() -> ConfluenceReader:
