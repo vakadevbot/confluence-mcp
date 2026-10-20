@@ -119,6 +119,26 @@ def _absolute_link(url: str | None, page_url: str) -> str | None:
     return urljoin(page_url, url)
 
 
+def _readable_text(html: str) -> str:
+    """Preserve punctuation and adjacency across inline HTML elements."""
+    readable = BeautifulSoup(html, 'html.parser')
+    for item in readable.find_all(['script', 'style', 'noscript', 'template']):
+        item.decompose()
+    for line_break in readable.find_all('br'):
+        line_break.replace_with('\n')
+    # Only structural boundaries introduce whitespace. Separating every text
+    # node corrupts hosts such as test<span>-int-</span>api.example.org.
+    for block in readable.find_all([
+        'p', 'div', 'section', 'article', 'li', 'tr', 'pre',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'ul', 'ol',
+    ]):
+        block.insert_before('\n')
+        block.append('\n')
+    for cell in readable.find_all(['td', 'th']):
+        cell.append('\t')
+    return readable.get_text().strip()
+
+
 def parse_content(html: str, page_url: str) -> dict[str, Any]:
     """Preserve original HTML while separately extracting text and media references."""
     soup = BeautifulSoup(html, 'html.parser')
@@ -137,18 +157,11 @@ def parse_content(html: str, page_url: str) -> dict[str, Any]:
     for anchor in soup.find_all('a', href=True):
         href = _absolute_link(anchor['href'], page_url)
         if href:
-            links.append({'text': anchor.get_text(' ', strip=True), 'url': href})
+            links.append({'text': anchor.get_text().strip(), 'url': href})
 
     scripts = soup.find_all('script')
     # Never execute or include script/style content in the human-readable text.
-    readable = BeautifulSoup(html, 'html.parser')
-    for item in readable.find_all(['script', 'style', 'noscript', 'template']):
-        item.decompose()
-    for line_break in readable.find_all('br'):
-        line_break.replace_with('\n')
-    for block in readable.find_all(['p', 'div', 'section', 'article', 'li', 'tr', 'pre', 'h1', 'h2', 'h3', 'h4']):
-        block.append('\n')
-    text = readable.get_text(' ', strip=True).replace(' \n', '\n').replace('\n ', '\n')
+    text = _readable_text(html)
 
     return {
         'html': html,
@@ -271,11 +284,9 @@ class ConfluenceReader:
             if len(json.dumps(url)) > 4000:
                 url = fallback
             title = str(content.get('title') or item.get('title') or '')
-            excerpt = BeautifulSoup(str(item.get('excerpt') or ''), 'html.parser')
-            for tag in excerpt.find_all(['script', 'style', 'noscript', 'template']):
-                tag.decompose()
-            matches = ' '.join(excerpt.get_text(' ', strip=True).split())
-            matches = matches.replace('@@@hl@@@', '**').replace('@@@endhl@@@', '**')
+            matches = _readable_text(str(item.get('excerpt') or ''))
+            matches = matches.replace('@@@hl@@@', '').replace('@@@endhl@@@', '')
+            matches = ' '.join(matches.split())
             entry = {'page_id': page_id, 'title': title[:300], 'url': url,
                      'matches': matches[:snippet_chars],
                      'truncated': len(title) > 300 or len(matches) > snippet_chars}

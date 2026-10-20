@@ -34,8 +34,10 @@ def search_pages(query: str, search_in: str = 'all', limit: int = 5,
                  start: int = 0, snippet_chars: int = 500) -> dict[str, Any]:
     """Search Confluence pages by title/content using a literal word or phrase.
     search_in: title, content (Confluence text index), or all. Returns titles,
-    URLs and short matching excerpts; ** marks highlighted matches when supplied
-    by Confluence. No full page bodies. Defaults: 5 pages, 500 excerpt characters.
+    URLs and short plain-text matching excerpts, preserving punctuation and inline
+    text adjacency. Search-index excerpts may differ from page content: verify
+    exact hostnames, URLs and identifiers with get_page_by_id before using them.
+    No full page bodies. Defaults: 5 pages, 500 excerpt characters.
     Hard limits: 20 pages, 1000 excerpt characters, 16000 serialized JSON characters.
     Use next_start as start to explicitly request another page; no auto-pagination.
     truncated indicates shortened fields or a response-size limit.

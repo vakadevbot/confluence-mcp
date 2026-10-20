@@ -106,3 +106,16 @@ def test_html_text_removes_script_and_preserves_html():
     assert 'alert(1)' in parsed['html']
     assert 'alert(1)' not in parsed['text']
     assert parsed['images'][0]['url'] == BASE + '/display/X/x.png'
+
+
+def test_page_text_preserves_inline_hostname_and_block_boundaries():
+    html = ('<p>Host: <a href="https://test-int-api.example.org">'
+            'test-<strong>int</strong>-api.example.org</a></p>'
+            '<table><tr><td>test-<span>int</span>-api</td><td>10.0.0.1</td></tr></table>')
+    parsed = parse_content(html, BASE)
+    assert parsed['html'] == html
+    assert 'test-int-api.example.org' in parsed['text']
+    assert parsed['links'][0]['text'] == 'test-int-api.example.org'
+    assert 'test-int-api\t10.0.0.1' in parsed['text']
+    assert 'example.orgtest' not in parsed['text']
+

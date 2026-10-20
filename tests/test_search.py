@@ -44,7 +44,7 @@ def test_search_request_and_excerpts(search_in, field):
     assert len(requests) == 1
     assert result['pages'][0] == {
         'page_id': '1', 'title': 'Deployment', 'url': BASE + '/pages/1/Deployment',
-        'matches': 'Use **deployment** safely', 'truncated': False,
+        'matches': 'Use deployment safely', 'truncated': False,
     }
     assert result['next_start'] == 11
     assert result['has_more'] is True
@@ -77,6 +77,30 @@ def test_empty_and_missing_excerpt():
     result = reader({'results': [page(excerpt='')]}).search_pages('hello')
     assert result['pages'][0]['matches'] == ''
     assert result['next_start'] is None
+
+
+@pytest.mark.parametrize('excerpt', [
+    'test-int-api.example.org',
+    'test<span>-int-</span>api.example.org',
+    '<a href="https://test-int-api.example.org">test-<em>int</em>-api.example.org</a>',
+    'test&#45;int&#x2d;api.example.org',
+    '@@@hl@@@test@@@endhl@@@-@@@hl@@@int@@@endhl@@@-api.example.org',
+    '<span>@@@hl@@@test@@@endhl@@@</span>-<b>int</b>-api.example.org',
+])
+def test_search_preserves_hyphenated_hostname(excerpt):
+    result = reader({'results': [page(excerpt=excerpt)]}).search_pages('test-int-api')
+    assert result['pages'][0]['matches'] == 'test-int-api.example.org'
+
+
+def test_excerpt_preserves_block_boundaries_and_literal_punctuation():
+    excerpt = '<p>test-<b>int</b>-api.example.org</p><p>--flag a_b /v1/test-api</p>'
+    result = reader({'results': [page(excerpt=excerpt)]}).search_pages('test')
+    assert result['pages'][0]['matches'] == 'test-int-api.example.org --flag a_b /v1/test-api'
+
+
+def test_search_does_not_invent_missing_hyphens():
+    result = reader({'results': [page(excerpt='testintapi')]}).search_pages('test-int-api')
+    assert result['pages'][0]['matches'] == 'testintapi'
 
 
 @pytest.mark.parametrize('kwargs', [
