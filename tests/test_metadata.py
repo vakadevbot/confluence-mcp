@@ -38,7 +38,7 @@ def test_metadata_for_cloud_and_server(id_field, method):
 
 
 def test_missing_metadata_is_null():
-    assert page_metadata({}) == dict(created_by=None, created_at=None,
+    assert page_metadata({}) == dict(space=None, created_by=None, created_at=None,
                                      last_modified_by=None, last_modified_at=None)
     assert page_metadata({'history': {'createdBy': {}}})['created_by'] is None
 

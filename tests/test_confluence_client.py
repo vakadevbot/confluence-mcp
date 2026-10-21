@@ -16,7 +16,7 @@ def test_page_by_id_renders_html_and_macros():
     def handler(request):
         assert request.method == 'GET'
         assert request.url.path == '/confluence/rest/api/content/123'
-        assert request.url.params['expand'] == 'body.view,body.storage,version,history'
+        assert request.url.params['expand'] == 'body.view,body.storage,version,history,space'
         assert request.headers['authorization'].startswith('Basic ')
         return httpx.Response(200, json={
             'id': '123', 'type': 'page', 'title': 'Example',
@@ -56,7 +56,7 @@ def test_extract_page_id(url, page_id):
 def test_slug_url_uses_html_fallback():
     def handler(request):
         if request.url.path == '/confluence/rest/api/content/456':
-            assert request.url.params['expand'] == 'history,version'
+            assert request.url.params['expand'] == 'history,version,space'
             return httpx.Response(200, json={'version': {'number': 2, 'when': '2026-10-21T12:00:00Z'}})
         assert request.url.path == '/confluence/display/DEV/Test'
         return httpx.Response(

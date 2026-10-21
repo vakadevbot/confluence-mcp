@@ -36,7 +36,7 @@ def test_search_request_and_excerpts(search_in, field):
         assert dict(request.url.params)['excerpt'] == 'highlight'
         assert request.url.params['limit'] == '5'
         assert request.url.params['start'] == '10'
-        assert request.url.params['expand'] == 'content.history,content.version'
+        assert request.url.params['expand'] == 'content.history,content.version,content.space'
         return httpx.Response(200, json={'results': [page()], '_links': {'next': '/next'}})
 
     result = ConfluenceReader(SETTINGS, httpx.MockTransport(handler)).search_pages(
@@ -45,7 +45,7 @@ def test_search_request_and_excerpts(search_in, field):
     assert result['pages'][0] == {
         'page_id': '1', 'title': 'Deployment', 'url': BASE + '/pages/1/Deployment',
         'matches': 'Use deployment safely', 'truncated': False,
-        'created_by': None, 'created_at': None,
+        'space': None, 'created_by': None, 'created_at': None,
         'last_modified_by': None, 'last_modified_at': None,
     }
     assert result['next_start'] == 11

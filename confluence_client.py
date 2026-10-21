@@ -10,7 +10,7 @@ from threading import Lock
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -186,6 +186,13 @@ def extract_macros(storage_html: str) -> list[dict[str, str]]:
     ]
 
 
+def space_metadata(space: Any) -> dict[str, str | None] | None:
+    if not isinstance(space, dict) or not space:
+        return None
+    return {key: str(space[key])[:size] if space.get(key) is not None else None
+            for key, size in (('id', 30), ('key', 255), ('name', 300))}
+
+
 def page_metadata(content: dict[str, Any]) -> dict[str, Any]:
     """Small, stable metadata for both Cloud and Server/Data Center responses."""
     def user(value: Any) -> dict[str, str | None] | None:
@@ -201,6 +208,7 @@ def page_metadata(content: dict[str, Any]) -> dict[str, Any]:
     history = content.get('history') or {}
     version = content.get('version') or {}
     return {
+        'space': space_metadata(content.get('space')),
         'created_by': user(history.get('createdBy')),
         'created_at': str(history['createdDate'])[:40] if history.get('createdDate') else None,
         'last_modified_by': user(version.get('by')),
@@ -258,7 +266,7 @@ class ConfluenceReader:
 
     def search_pages(
         self, query: str, search_in: str = 'all', limit: int = 5,
-        start: int = 0, snippet_chars: int = 500,
+        start: int = 0, snippet_chars: int = 500, space_key: str | None = None,
     ) -> dict[str, Any]:
         """Search one bounded CQL page; never fetch full page bodies or follow next links."""
         if not isinstance(query, str) or not query.strip() or len(query) > 500:
@@ -277,11 +285,13 @@ class ConfluenceReader:
         value = '"' + phrase.replace('\\', '\\\\').replace('"', '\\"') + '"'
         clause = {'title': f'title ~ {value}', 'content': f'text ~ {value}',
                   'all': f'(title ~ {value} OR text ~ {value})'}[search_in]
+        if space_key is not None:
+            clause += f' AND space = {json.dumps(self._space_key(space_key), ensure_ascii=False)}'
         raw, charset = self._get(
             f'{self.settings.base_url}/rest/api/search',
             params={'cql': f'type = page AND {clause}', 'limit': str(limit),
                     'start': str(start), 'excerpt': 'highlight',
-                    'expand': 'content.history,content.version'},
+                    'expand': 'content.history,content.version,content.space'},
             accept='application/json',
         )
         try:
@@ -316,6 +326,10 @@ class ConfluenceReader:
                      'truncated': len(title) > 300 or len(matches) > snippet_chars}
             output['pages'].append(entry)
             # Reserve room for pagination metadata. Includes JSON escaping overhead.
+            if len(output['pages']) == 1:
+                while len(json.dumps(output)) > 15_500 and entry['matches']:
+                    entry['matches'] = entry['matches'][:len(entry['matches']) // 2]
+                    entry['truncated'] = True
             if len(json.dumps(output)) > 15_500:
                 output['pages'].pop()
                 if not output['pages']:
@@ -328,6 +342,117 @@ class ConfluenceReader:
         output['next_start'] = start + consumed if output['has_more'] else None
         output['truncated'] = output['truncated'] or any(p['truncated'] for p in output['pages'])
         return output
+
+    @staticmethod
+    def _space_key(space_key: str) -> str:
+        if (not isinstance(space_key, str) or not space_key.strip()
+                or len(space_key) > 255 or space_key in ('.', '..')
+                or any(ord(c) < 32 for c in space_key)):
+            raise ConfluenceError('space_key must contain 1–255 non-control characters.')
+        return space_key
+
+    @staticmethod
+    def _pagination(limit: int, start: int) -> None:
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise ConfluenceError('limit must be an integer between 1 and 20.')
+        if type(start) is not int or not 0 <= start <= 1_000_000:
+            raise ConfluenceError('start must be an integer between 0 and 1000000.')
+
+    def _json(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+        raw, charset = self._get(self.settings.base_url + path, params=params, accept='application/json')
+        try:
+            result = json.loads(raw.decode(charset))
+        except (ValueError, UnicodeError, LookupError) as exc:
+            raise ConfluenceError('Confluence REST API did not return valid JSON.') from exc
+        if not isinstance(result, dict):
+            raise ConfluenceError('Unexpected Confluence REST API response.')
+        return result
+
+    def _summary(self, content: dict[str, Any]) -> dict[str, Any]:
+        page_id = str(content.get('id', ''))
+        if not re.fullmatch(r'[1-9]\d{0,29}', page_id):
+            raise ConfluenceError('Invalid page ID in Confluence response.')
+        title = str(content.get('title') or '')
+        fallback = f'{self.settings.base_url}/pages/viewpage.action?pageId={page_id}'
+        webui = (content.get('_links') or {}).get('webui')
+        url = urljoin(self.settings.base_url + '/', webui) if isinstance(webui, str) else fallback
+        self.settings.validate_url(url)
+        return {'page_id': page_id, 'title': title[:300],
+                'url': url if len(json.dumps(url)) <= 4000 else fallback,
+                **page_metadata(content), 'truncated': len(title) > 300}
+
+    def _collection(self, data: dict[str, Any], key: str, limit: int, start: int,
+                    transform: Any) -> dict[str, Any]:
+        results = data.get('results')
+        if not isinstance(results, list):
+            raise ConfluenceError('Unexpected Confluence collection response.')
+        output: dict[str, Any] = {key: [], 'has_more': False, 'next_start': None, 'truncated': False}
+        consumed = 0
+        for item in results[:limit]:
+            if not isinstance(item, dict):
+                raise ConfluenceError('Unexpected Confluence collection item.')
+            entry = transform(item)
+            if entry is not None:
+                output[key].append(entry)
+                if len(json.dumps(output)) > 15_500:
+                    output[key].pop()
+                    if consumed == 0:
+                        raise ConfluenceError('Collection item exceeds response budget.')
+                    output['truncated'] = True
+                    break
+            consumed += 1
+        output['has_more'] = bool(consumed < len(results) or (data.get('_links') or {}).get('next')
+                                  or len(results) >= limit)
+        output['next_start'] = start + consumed if output['has_more'] else None
+        output['truncated'] |= any(item.get('truncated', False) for item in output[key])
+        return output
+
+    def search_spaces(self, query: str = '', limit: int = 20, start: int = 0) -> dict[str, Any]:
+        """Filter one bounded batch of spaces by name, key or ID; never scan automatically."""
+        self._pagination(limit, start)
+        if not isinstance(query, str) or len(query) > 500:
+            raise ConfluenceError('query must contain at most 500 characters.')
+        needle = query.strip().casefold()
+        data = self._json('/rest/api/space', {'limit': str(limit), 'start': str(start)})
+
+        def match(item: dict[str, Any]) -> dict[str, Any] | None:
+            if not any(needle in str(item.get(field) or '').casefold() for field in ('name', 'key', 'id')):
+                return None
+            result = space_metadata(item)
+            if result is None:
+                raise ConfluenceError('Unexpected empty space.')
+            return {**result, 'truncated': any(len(str(item.get(k) or '')) > n
+                                              for k, n in (('id', 30), ('key', 255), ('name', 300)))}
+
+        return self._collection(data, 'spaces', limit, start, match)
+
+    def get_space_pages(self, space_key: str, limit: int = 10, start: int = 0) -> dict[str, Any]:
+        self._pagination(limit, start)
+        key = quote(self._space_key(space_key), safe='')
+        data = self._json(f'/rest/api/space/{key}/content/page',
+                          {'limit': str(limit), 'start': str(start), 'depth': 'all',
+                           'expand': 'history,version,space'})
+        return self._collection(data, 'pages', limit, start, self._summary)
+
+    def get_page_children(self, page_id: str, limit: int = 10, start: int = 0) -> dict[str, Any]:
+        self._pagination(limit, start)
+        if not isinstance(page_id, str) or not re.fullmatch(r'[1-9]\d{0,29}', page_id):
+            raise ConfluenceError('page_id must be a positive decimal integer.')
+        data = self._json(f'/rest/api/content/{page_id}/child/page',
+                          {'limit': str(limit), 'start': str(start), 'expand': 'history,version,space'})
+        return self._collection(data, 'pages', limit, start, self._summary)
+
+    def get_page_parent(self, page_id: str) -> dict[str, Any]:
+        content = self._content(page_id, 'ancestors')
+        ancestors = content.get('ancestors')
+        if not isinstance(ancestors, list):
+            raise ConfluenceError('Confluence did not return page ancestors.')
+        if not ancestors:
+            return {'parent': None}
+        if not isinstance(ancestors[-1], dict):
+            raise ConfluenceError('Unexpected page ancestor.')
+        parent_id = str(ancestors[-1].get('id', ''))
+        return {'parent': self._summary(self._content(parent_id, 'history,version,space'))}
 
     def _content(self, page_id: str | int, expand: str) -> dict[str, Any]:
         page_id = str(page_id)
@@ -347,7 +472,7 @@ class ConfluenceReader:
         return result
 
     def by_id(self, page_id: str | int) -> dict[str, Any]:
-        result = self._content(page_id, 'body.view,body.storage,version,history')
+        result = self._content(page_id, 'body.view,body.storage,version,history,space')
         page_id = str(page_id)
         body = result.get('body') or {}
         view = (body.get('view') or {}).get('value')
@@ -394,7 +519,7 @@ class ConfluenceReader:
         meta_id = document.select_one('meta[name="ajs-page-id"]')
         possible_id = meta_id.get('content') if meta_id else None
         actual_id = possible_id if possible_id and re.fullmatch(r'[1-9]\d*', possible_id) else None
-        metadata = self._content(actual_id, 'history,version') if actual_id else {}
+        metadata = self._content(actual_id, 'history,version,space') if actual_id else {}
         return {
             'page_id': actual_id,
             'title': title,
