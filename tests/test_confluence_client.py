@@ -16,7 +16,7 @@ def test_page_by_id_renders_html_and_macros():
     def handler(request):
         assert request.method == 'GET'
         assert request.url.path == '/confluence/rest/api/content/123'
-        assert request.url.params['expand'] == 'body.view,body.storage,version'
+        assert request.url.params['expand'] == 'body.view,body.storage,version,history'
         assert request.headers['authorization'].startswith('Basic ')
         return httpx.Response(200, json={
             'id': '123', 'type': 'page', 'title': 'Example',
@@ -55,6 +55,9 @@ def test_extract_page_id(url, page_id):
 
 def test_slug_url_uses_html_fallback():
     def handler(request):
+        if request.url.path == '/confluence/rest/api/content/456':
+            assert request.url.params['expand'] == 'history,version'
+            return httpx.Response(200, json={'version': {'number': 2, 'when': '2026-10-21T12:00:00Z'}})
         assert request.url.path == '/confluence/display/DEV/Test'
         return httpx.Response(
             200, text='<html><head><meta name="ajs-page-id" content="456"></head>'
@@ -65,6 +68,8 @@ def test_slug_url_uses_html_fallback():
     result = reader(handler).by_url(BASE + '/display/DEV/Test')
     assert result['source'] == 'web_html'
     assert result['page_id'] == '456'
+    assert result['last_modified_at'] == '2026-10-21T12:00:00Z'
+    assert result['version'] == 2
     assert result['text'].strip() == 'Visible content'
     assert result['embedded_media'][0]['url'] == 'https://wiki.example.org/confluence/embed'
 

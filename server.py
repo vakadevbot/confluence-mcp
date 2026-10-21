@@ -38,6 +38,8 @@ def search_pages(query: str, search_in: str = 'all', limit: int = 5,
     text adjacency. Search-index excerpts may differ from page content: verify
     exact hostnames, URLs and identifiers with get_page_by_id before using them.
     No full page bodies. Defaults: 5 pages, 500 excerpt characters.
+    Each page includes created_by, created_at, last_modified_by, last_modified_at.
+    Authors contain display_name and id; unavailable metadata is null.
     Hard limits: 20 pages, 1000 excerpt characters, 16000 serialized JSON characters.
     Use next_start as start to explicitly request another page; no auto-pagination.
     truncated indicates shortened fields or a response-size limit.
@@ -56,7 +58,9 @@ def search_pages(query: str, search_in: str = 'all', limit: int = 5,
 @mcp.tool()
 def get_page_by_id(page_id: str) -> dict[str, Any]:
     """Read a Confluence page by numeric ID. Returns rendered HTML, text, links,
-    image URLs, embedded media and macro metadata. Read-only: no page changes.
+    image URLs, embedded media and macro metadata. Includes created_by, created_at,
+    last_modified_by and last_modified_at (authors: display_name and id).
+    Unavailable metadata is null. Read-only: no page changes.
     """
     logger.info("get_page_by_id started: page_id=%r", page_id)
     try:
@@ -75,7 +79,10 @@ def get_page_by_id(page_id: str) -> dict[str, Any]:
 def get_page_by_url(url: str) -> dict[str, Any]:
     """Read a Confluence page by its full URL. URL must be within
     CONFLUENCE_BASE_URL. Supports /display/ links, viewpage.action?pageId=
-    and /pages/{id}/ links. Returns HTML, text and media references.
+    and /pages/{id}/ links. Returns HTML, text, media references, created_by,
+    created_at, last_modified_by and last_modified_at. Authors contain display_name
+    and id. Unavailable metadata is null; HTML pages without a page ID cannot
+    resolve REST metadata.
     """
     # Avoid logging full URLs: query strings may contain confidential tokens.
     logger.info("get_page_by_url started")

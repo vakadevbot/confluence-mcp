@@ -186,6 +186,28 @@ def extract_macros(storage_html: str) -> list[dict[str, str]]:
     ]
 
 
+def page_metadata(content: dict[str, Any]) -> dict[str, Any]:
+    """Small, stable metadata for both Cloud and Server/Data Center responses."""
+    def user(value: Any) -> dict[str, str | None] | None:
+        if not isinstance(value, dict):
+            return None
+        name = value.get('displayName')
+        identifier = value.get('accountId') or value.get('userKey') or value.get('username')
+        if not name and not identifier:
+            return None
+        return {'display_name': str(name)[:128] if name else None,
+                'id': str(identifier)[:64] if identifier else None}
+
+    history = content.get('history') or {}
+    version = content.get('version') or {}
+    return {
+        'created_by': user(history.get('createdBy')),
+        'created_at': str(history['createdDate'])[:40] if history.get('createdDate') else None,
+        'last_modified_by': user(version.get('by')),
+        'last_modified_at': str(version['when'])[:40] if version.get('when') else None,
+    }
+
+
 class ConfluenceReader:
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None):
         self.settings = settings
@@ -258,7 +280,8 @@ class ConfluenceReader:
         raw, charset = self._get(
             f'{self.settings.base_url}/rest/api/search',
             params={'cql': f'type = page AND {clause}', 'limit': str(limit),
-                    'start': str(start), 'excerpt': 'highlight'},
+                    'start': str(start), 'excerpt': 'highlight',
+                    'expand': 'content.history,content.version'},
             accept='application/json',
         )
         try:
@@ -288,6 +311,7 @@ class ConfluenceReader:
             matches = matches.replace('@@@hl@@@', '').replace('@@@endhl@@@', '')
             matches = ' '.join(matches.split())
             entry = {'page_id': page_id, 'title': title[:300], 'url': url,
+                     **page_metadata(content),
                      'matches': matches[:snippet_chars],
                      'truncated': len(title) > 300 or len(matches) > snippet_chars}
             output['pages'].append(entry)
@@ -305,12 +329,12 @@ class ConfluenceReader:
         output['truncated'] = output['truncated'] or any(p['truncated'] for p in output['pages'])
         return output
 
-    def by_id(self, page_id: str | int) -> dict[str, Any]:
+    def _content(self, page_id: str | int, expand: str) -> dict[str, Any]:
         page_id = str(page_id)
         if not re.fullmatch(r'[1-9]\d*', page_id):
             raise ConfluenceError('page_id must be a positive decimal integer.')
         url = f'{self.settings.base_url}/rest/api/content/{page_id}'
-        raw, charset = self._get(url, params={'expand': 'body.view,body.storage,version'}, accept='application/json')
+        raw, charset = self._get(url, params={'expand': expand}, accept='application/json')
         try:
             import json
             result = json.loads(raw.decode(charset))
@@ -320,6 +344,11 @@ class ConfluenceReader:
             raise ConfluenceError('Unexpected Confluence REST API response.')
         if result.get('type') not in (None, 'page'):
             raise ConfluenceError('The specified ID does not refer to a Confluence page.')
+        return result
+
+    def by_id(self, page_id: str | int) -> dict[str, Any]:
+        result = self._content(page_id, 'body.view,body.storage,version,history')
+        page_id = str(page_id)
         body = result.get('body') or {}
         view = (body.get('view') or {}).get('value')
         if not isinstance(view, str):
@@ -335,6 +364,7 @@ class ConfluenceReader:
             'url': canonical,
             'source': 'rest_body_view',
             'version': (result.get('version') or {}).get('number'),
+            **page_metadata(result),
             'macros': macros,
             **parsed,
             'note': 'HTML and media references are returned, but JavaScript is not executed; interactive macros, diagrams and images may require a browser or separate authenticated retrieval.',
@@ -364,12 +394,14 @@ class ConfluenceReader:
         meta_id = document.select_one('meta[name="ajs-page-id"]')
         possible_id = meta_id.get('content') if meta_id else None
         actual_id = possible_id if possible_id and re.fullmatch(r'[1-9]\d*', possible_id) else None
+        metadata = self._content(actual_id, 'history,version') if actual_id else {}
         return {
             'page_id': actual_id,
             'title': title,
             'url': url,
             'source': 'web_html',
-            'version': None,
+            'version': (metadata.get('version') or {}).get('number'),
+            **page_metadata(metadata),
             'macros': [],
             **parse_content(str(content), url),
             'note': 'HTML and media references are returned, but JavaScript is not executed; interactive macros, diagrams and images may require a browser or separate authenticated retrieval.',
