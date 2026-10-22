@@ -6,6 +6,7 @@ import os
 import re
 import json
 import time
+import unicodedata
 from threading import Lock
 from dataclasses import dataclass
 from pathlib import Path
@@ -407,24 +408,75 @@ class ConfluenceReader:
         output['truncated'] |= any(item.get('truncated', False) for item in output[key])
         return output
 
-    def search_spaces(self, query: str = '', limit: int = 20, start: int = 0) -> dict[str, Any]:
-        """Filter one bounded batch of spaces by name, key or ID; never scan automatically."""
+    def search_spaces(self, query: str = '', limit: int = 20, start: int = 0,
+                      max_batches: int = 10) -> dict[str, Any]:
+        """Search bounded batches until enough matches, exhaustion or a scan limit."""
         self._pagination(limit, start)
         if not isinstance(query, str) or len(query) > 500:
             raise ConfluenceError('query must contain at most 500 characters.')
-        needle = query.strip().casefold()
-        data = self._json('/rest/api/space', {'limit': str(limit), 'start': str(start)})
+        if type(max_batches) is not int or not 1 <= max_batches <= 20:
+            raise ConfluenceError('max_batches must be an integer between 1 and 20.')
 
-        def match(item: dict[str, Any]) -> dict[str, Any] | None:
-            if not any(needle in str(item.get(field) or '').casefold() for field in ('name', 'key', 'id')):
-                return None
-            result = space_metadata(item)
-            if result is None:
-                raise ConfluenceError('Unexpected empty space.')
-            return {**result, 'truncated': any(len(str(item.get(k) or '')) > n
-                                              for k, n in (('id', 30), ('key', 255), ('name', 300)))}
+        def normalize(value: Any) -> str:
+            return ' '.join(unicodedata.normalize('NFKC', str(value or '')).casefold().split())
 
-        return self._collection(data, 'spaces', limit, start, match)
+        needle = normalize(query)
+        batch_size = 100 if needle else limit
+        batch_count = max_batches if needle else 1
+        output: dict[str, Any] = {'spaces': [], 'has_more': False, 'next_start': None,
+                                  'truncated': False, 'scanned': 0, 'scan_limit_reached': False}
+        offset = start
+
+        def continuation(next_start: int, scan_limit: bool = False) -> dict[str, Any]:
+            output.update(has_more=True, next_start=next_start, scan_limit_reached=scan_limit)
+            return output
+
+        for batch in range(batch_count):
+            data = self._json('/rest/api/space', {'limit': str(batch_size), 'start': str(offset)})
+            results = data.get('results')
+            if not isinstance(results, list) or len(results) > batch_size:
+                raise ConfluenceError('Unexpected Confluence space collection response.')
+            if 'start' in data and data['start'] != offset:
+                raise ConfluenceError('Confluence returned an unexpected pagination offset.')
+            next_link = (data.get('_links') or {}).get('next')
+            more = bool(next_link or len(results) == batch_size)
+            if not results:
+                if next_link:
+                    raise ConfluenceError('Confluence pagination returned an empty batch with a next link.')
+                return output
+            next_offset = offset + len(results)
+            if next_link:
+                try:
+                    next_values = parse_qs(urlsplit(next_link).query).get('start')
+                    if next_values:
+                        next_offset = int(next_values[0])
+                except (TypeError, ValueError) as exc:
+                    raise ConfluenceError('Invalid Confluence pagination link.') from exc
+                if next_offset < offset + len(results):
+                    raise ConfluenceError('Confluence pagination did not advance.')
+            for index, item in enumerate(results):
+                if not isinstance(item, dict) or not item:
+                    raise ConfluenceError('Unexpected Confluence space item.')
+                if any(needle in normalize(item.get(field)) for field in ('name', 'key', 'id')):
+                    entry = {**space_metadata(item), 'truncated': any(
+                        len(str(item.get(k) or '')) > n for k, n in (('id', 30), ('key', 255), ('name', 300)))}
+                    output['spaces'].append(entry)
+                    if len(json.dumps(output)) > 15_500:
+                        output['spaces'].pop()
+                        output['truncated'] = True
+                        return continuation(offset + index)
+                    output['truncated'] |= entry['truncated']
+                output['scanned'] += 1
+                if len(output['spaces']) == limit:
+                    if index + 1 < len(results):
+                        return continuation(offset + index + 1)
+                    return continuation(next_offset) if more else output
+            if not more:
+                return output
+            if batch + 1 == batch_count:
+                return continuation(next_offset, scan_limit=bool(needle))
+            offset = next_offset
+        return output
 
     def get_space_pages(self, space_key: str, limit: int = 10, start: int = 0) -> dict[str, Any]:
         self._pagination(limit, start)

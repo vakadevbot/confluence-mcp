@@ -58,14 +58,18 @@ def search_pages(query: str, search_in: str = 'all', limit: int = 5,
 
 
 @mcp.tool()
-def search_spaces(query: str = '', limit: int = 20, start: int = 0) -> dict[str, Any]:
+def search_spaces(query: str = '', limit: int = 20, start: int = 0,
+                  max_batches: int = 10) -> dict[str, Any]:
     """Find spaces by case-insensitive substring of name, key or ID.
-    Scans ONE API batch of up to limit spaces (1–20), then filters it locally.
-    Empty query lists spaces. An empty spaces list does NOT mean search is over:
-    use next_start while has_more is true to check subsequent batches explicitly.
+    limit (1–20) is the number of MATCHES to return. Nonempty queries automatically
+    scan up to max_batches (default 10, range 1–20), at most 100 spaces per batch.
+    Matching normalizes Unicode, case and whitespace. Empty query lists one batch.
+    scanned counts inspected spaces. scan_limit_reached means the search is incomplete.
+    Whenever has_more is true, resume with the same query and start=next_start.
+    Only an empty spaces list with has_more=false means no further matches.
     Returns spaces with id, key, name; response capped at 16000 JSON characters.
     """
-    return _reader().search_spaces(query, limit, start)
+    return _reader().search_spaces(query, limit, start, max_batches)
 
 
 @mcp.tool()

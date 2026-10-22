@@ -58,10 +58,11 @@ def test_space_search(query):
 def test_space_filter_advances_over_nonmatching_batch():
     result = reader(lambda _: httpx.Response(200, json={
         'results': [SPACE, SPACE], '_links': {'next': '/next'},
-    })).search_spaces('missing', limit=2, start=4)
+    })).search_spaces('missing', limit=2, start=4, max_batches=1)
     assert result['spaces'] == []
     assert result['next_start'] == 6
     assert result['has_more']
+    assert result['scan_limit_reached']
 
 
 @pytest.mark.parametrize('method,arg,path', [
